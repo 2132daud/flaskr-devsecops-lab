@@ -5,4 +5,5 @@ click==8.1.7
 itsdangerous==2.1.2
 markupsafe==2.1.3
 pytest==7.4.0
-bandit==1.7.5
+bandit==1.7.8
+pbr==6.0.0
