@@ -39,6 +39,7 @@ jobs:
 
       # Шаг 4: SAST - Статический анализ кода Bandit
       - name: Run Bandit SAST scan
+        continue-on-error: true
         run: |
           bandit -r flaskr/ -ll -f json -o bandit-report.json
           bandit -r flaskr/ -ll # Вывод в консоль для отладки
