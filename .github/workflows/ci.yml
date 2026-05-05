@@ -1,0 +1,297 @@
+name: DevSecOps CI Pipeline with DAST and Security Gates
+
+on:
+  push:
+    branches: ["main", "develop"]
+  pull_request:
+    branches: ["main"]
+  workflow_dispatch:
+
+jobs:
+  # Job 1: Статический анализ (старый код)
+  static-analysis:
+    runs-on: ubuntu-latest
+
+    steps:
+      # Шаг 0: Скачать код в виртуальную машину робота
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 
+
+      # Шаг 1: Установить Python
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # Шаг 2: Установить зависимости из нашего файла
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest flake8
+          pip install -e .
+
+      # Шаг 3: Запустить юнит-тесты
+      - name: Run unit tests
+        run: |
+          pytest tests/ -v
+
+      # Шаг 4: SAST - Статический анализ кода Bandit
+      - name: Run Bandit SAST scan
+        continue-on-error: true
+        run: |
+          bandit -r flaskr/ -ll -f json -o bandit-report.json
+          bandit -r flaskr/ -ll # Вывод в консоль для отладки
+
+      # Шаг 5: SCA - Анализ зависимостей Trivy
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs' # Сканировать файловую систему
+          scan-ref: '.' # Что сканировать (текущую папку)
+          format: 'json' # Формат отчета
+          output: 'trivy-report.json' # Имя файла отчета
+          severity: 'CRITICAL,HIGH,MEDIUM' # Какие уровни уязвимостей искать
+
+      # Шаг 6: Сканирование секретов Gitleaks
+      - name: Run Gitleaks secret scanner
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} # Токен для доступа к API GitHub
+
+      # Шаг 7: Сохранить отчеты как артефакты
+      - name: Upload security reports
+        uses: actions/upload-artifact@v4
+        if: always() # Важно! Выполнять этот шаг всегда, даже если проверки упали с ошибкой
+        with:
+          name: security-reports
+          path: |
+            bandit-report.json
+            trivy-report.json
+
+  # Job 2: ДИНАМИЧЕСКИЙ АНАЛИЗ (НОВОЕ!)
+  dast-scan:
+    runs-on: ubuntu-latest
+    needs: static-analysis # Ждём завершения статического анализа
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install -e .
+
+      - name: Start Flask app
+        run: |
+          echo "🚀 Запускаем Flask-приложение..."
+          flask --app flaskr run --host=0.0.0.0 --port=5000 &
+          sleep 15  # Даём время на запуск
+          echo "✅ Приложение запущено, начинаем сканирование"
+
+      - name: Log in to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+
+      - name: Run OWASP ZAP baseline scan
+        run: |
+          mkdir -p zap-reports
+          docker run --rm \
+            -v $(pwd)/zap-reports:/zap/wrk:rw \
+            --add-host=host.docker.internal:host-gateway \
+            ghcr.io/zaproxy/zaproxy:stable \
+            zap-baseline.py \
+            -t http://host.docker.internal:5000 \
+            -J zap-report.json \
+            -r zap-report.html \
+            || echo "⚠️ ZAP scan completed with findings (это нормально)"
+
+      # Сохраняем отчёты ZAP
+      - name: Upload DAST reports
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: dast-reports
+          path: zap-reports/
+
+  # Job 3: SECURITY GATE — ПРОВЕРКА РЕЗУЛЬТАТОВ (НОВОЕ!)
+  security-gate:
+    runs-on: ubuntu-latest
+    needs: [static-analysis, dast-scan] # Ждём оба сканирования
+    if: always() # Всегда выполняем, даже если предыдущие упали
+    steps:
+      # Устанавливаем jq для парсинга JSON-отчётов
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      # Скачиваем отчёты статического анализа
+      - name: Download SAST reports
+        uses: actions/download-artifact@v4
+        with:
+          name: security-reports  # Имя артефакта из static-analysis
+          path: sast-reports/
+
+      # Скачиваем отчёты динамического анализа
+      - name: Download DAST reports
+        uses: actions/download-artifact@v4
+        with:
+          name: dast-reports  # Имя артефакта из dast-scan
+          path: dast-reports/
+
+      # ПРОВЕРКА 1: Ищем CRITICAL уязвимости в зависимостях
+      - name: Check for CRITICAL vulnerabilities in Trivy report
+        run: |
+          if [ -f sast-reports/trivy-report.json ]; then
+            CRITICAL_COUNT=$(jq '.Results[].Vulnerabilities[] | select(.Severity=="CRITICAL")' sast-reports/trivy-report.json | wc -l)
+            if [ "$CRITICAL_COUNT" -gt 0 ]; then
+              echo "❌ Найдено $CRITICAL_COUNT CRITICAL уязвимостей в зависимостях!"
+              echo "Релиз заблокирован! Исправьте критические уязвимости."
+              exit 1
+            else
+              echo "✅ Критических уязвимостей в зависимостях не найдено"
+            fi
+          else
+            echo "⚠️ Отчёт Trivy не найден"
+          fi
+
+      # ПРОВЕРКА 2: Ищем HIGH риски в ZAP-сканировании
+      - name: Check for HIGH risk alerts in ZAP report
+        run: |
+          if [ -f dast-reports/zap-report.json ]; then
+            HIGH_COUNT=$(jq '.site[].alerts[] | select(.risk=="High")' dast-reports/zap-report.json | wc -l)
+            if [ "$HIGH_COUNT" -gt 0 ]; then
+              echo "❌ Найдено $HIGH_COUNT HIGH-рисков в веб-приложении!"
+              echo "Релиз заблокирован! Исправьте уязвимости высокой степени риска."
+              exit 1
+            else
+              echo "✅ HIGH-рисков не обнаружено"
+            fi
+          else
+            echo "⚠️ Отчёт ZAP не найден, пропускаем проверку"
+          fi
+
+      # ФИНАЛЬНЫЙ ШАГ: Все проверки пройдены
+      - name: Security gate passed
+        run: |
+          echo "🎉 Все проверки безопасности пройдены успешно!"
+          echo "✅ Можно продолжать развёртывание"
+
+  # Job 4: КОММЕНТАРИИ В PULL REQUEST
+  comment-pr:
+    runs-on: ubuntu-latest
+    needs: [static-analysis, dast-scan, security-gate] # Ждём все проверки
+    if: github.event_name == 'pull_request' # Только для Pull Request!
+    permissions:
+      pull-requests: write # Разрешаем писать комментарии в PR
+      contents: read # Разрешаем читать код
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # Скачиваем отчёты для анализа
+      - name: Download SAST reports
+        uses: actions/download-artifact@v4
+        with:
+          name: security-reports
+          path: sast-reports/
+
+      - name: Download DAST reports
+        uses: actions/download-artifact@v4
+        with:
+          name: dast-reports
+          path: dast-reports/
+
+      # СОЗДАЁМ КРАСИВЫЙ КОММЕНТАРИЙ В PR
+      - name: Comment PR with security findings
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            let comment = '## 🔒 Результаты сканирования безопасности\n\n';
+
+            // Анализируем Trivy (зависимости)
+            if (fs.existsSync('sast-reports/trivy-report.json')) {
+              const trivyData = JSON.parse(fs.readFileSync('sast-reports/trivy-report.json', 'utf8'));
+              const vulns = [];
+              
+              trivyData.Results.forEach(result => {
+                if (result.Vulnerabilities) {
+                  result.Vulnerabilities.forEach(v => {
+                    if (v.Severity === 'CRITICAL' || v.Severity === 'HIGH') {
+                      vulns.push({
+                        severity: v.Severity,
+                        package: result.Target,
+                        vulnId: v.VulnerabilityID,
+                        title: v.Title,
+                        fixedVersion: v.FixedVersion || 'Н/Д'
+                      });
+                    }
+                  });
+                }
+              });
+
+              comment += '### 📦 Уязвимости в зависимостях (Trivy)\n\n';
+              if (vulns.length > 0) {
+                comment += '| Срочность | Пакет | Уязвимость | Исправление |\n';
+                comment += '|-----------|-------|------------|-------------|\n';
+                vulns.forEach(v => {
+                  comment += `| ${v.severity} | ${v.package} | ${v.vulnId} - ${v.title} | ${v.fixedVersion} |\n`;
+                });
+                comment += '\n⚠️ **Найдены уязвимости! Требуется исправление.**\n\n';
+              } else {
+                comment += '✅ Уязвимостей HIGH/CRITICAL не найдено\n\n';
+              }
+            }
+
+            // Анализируем ZAP (веб-приложение)
+            if (fs.existsSync('dast-reports/zap-report.json')) {
+              const zapData = JSON.parse(fs.readFileSync('dast-reports/zap-report.json', 'utf8'));
+              const highAlerts = [];
+              const mediumAlerts = [];
+              
+              if (zapData.site && zapData.site[0] && zapData.site[0].alerts) {
+                zapData.site[0].alerts.forEach(alert => {
+                  if (alert.risk === 'High') highAlerts.push(alert);
+                  if (alert.risk === 'Medium') mediumAlerts.push(alert);
+                });
+              }
+
+              comment += '### 🛡️ Уязвимости веб-приложения (OWASP ZAP)\n\n';
+              if (highAlerts.length > 0) {
+                comment += `🔴 Найдено предупреждений HIGH: **${highAlerts.length}**\n`;
+                highAlerts.forEach(a => {
+                  comment += `- ${a.name}: ${a.description.substring(0, 100)}...\n`;
+                });
+                comment += '\n';
+              }
+              if (mediumAlerts.length > 0) {
+                comment += `🟡 Найдено предупреждений MEDIUM: **${mediumAlerts.length}**\n\n`;
+              }
+              if (highAlerts.length === 0 && mediumAlerts.length === 0) {
+                comment += '✅ Уязвимостей HIGH/MEDIUM не найдено\n\n';
+              }
+            }
+
+            // Рекомендации
+            comment += '### 📋 Рекомендации\n\n';
+            comment += '1. **Уязвимости CRITICAL/HIGH нужно исправить до merge**\n';
+            comment += '2. Обновите уязвимые пакеты до безопасных версий\n';
+            comment += '3. Никогда не храните секреты в коде\n';
+            comment += '4. Добавьте security unit-тесты\n\n';
+            comment += '---\n';
+            comment += '🤖 *Автоматическое сканирование безопасности | DevSecOps Pipeline*';
+
+            // Публикуем комментарий
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: comment
+            });
+            console.log('✅ Комментарий опубликован в PR');
