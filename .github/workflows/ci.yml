@@ -70,6 +70,8 @@ jobs:
           path: |
             bandit-report.json
             trivy-report.json
+            results.sarif
+             
 
   # Job 2: ДИНАМИЧЕСКИЙ АНАЛИЗ (НОВОЕ!)
   dast-scan:
